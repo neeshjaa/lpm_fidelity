@@ -3,7 +3,8 @@ name: Python unit tests
 on: pull_request
 
 jobs:
-  runs-on: ubuntu-latest
+  runs-on:
+    - ubuntu-latest
   steps:
     - name: Check out the repository
       uses: actions/checkout@v4
