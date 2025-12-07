@@ -180,6 +180,7 @@ def test_bivariate_distance_no_overlap_spot():
         == 0.25
     )
 
+
 @pytest.mark.parametrize("distance_metric", ["tvd", "kl", "js"])
 def test_bivariate_distances_in_data_smoke(distance_metric):
     df = pl.DataFrame(
