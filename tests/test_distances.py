@@ -1,11 +1,13 @@
 import polars as pl
 import pytest
 
-from lpm_fidelity.distances import tvd
-from lpm_fidelity.distances import bivariate_distance
-from lpm_fidelity.distances import bivariate_distances_in_data
-from lpm_fidelity.distances import univariate_distance
-from lpm_fidelity.distances import univariate_distances_in_data
+from lpm_fidelity.distances import (
+    bivariate_distance,
+    bivariate_distances_in_data,
+    tvd,
+    univariate_distance,
+    univariate_distances_in_data,
+)
 
 
 @pytest.mark.parametrize(
