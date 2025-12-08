@@ -1,7 +1,12 @@
+import string
+
 import polars as pl
 import pytest
+from jax import numpy as jnp
 
+from lpm_fidelity.counting import OrdinalDF
 from lpm_fidelity.distances import (
+    DistanceMetric,
     bivariate_distance,
     bivariate_distances_in_data,
     tvd,
@@ -45,7 +50,7 @@ def test_tvd_1(P, Q):
 
 
 def test_tvd_spot_check():
-    assert tvd([0.5, 0.5], [0.9, 0.1]) == 0.4
+    assert tvd([0.5, 0.5], [0.9, 0.1]) == pytest.approx(0.4)
 
 
 @pytest.mark.parametrize("distance_metric", ["tvd", "kl", "js"])
@@ -67,13 +72,17 @@ def test_univariate_distance_transitivity(distance_metric):
 def test_univariate_distance_spot():
     column_a = ["a"] * 5 + ["b"] * 5
     column_b = ["a"] * 9 + ["b"] * 1
-    assert univariate_distance(column_a, column_b, distance_metric="tvd") == 0.4
+    assert univariate_distance(
+        column_a, column_b, distance_metric="tvd"
+    ) == pytest.approx(0.4)
 
 
 def test_univariate_distance_spot_different_length():
     column_a = ["a", "b"]
     column_b = ["a"] * 9 + ["b"] * 1
-    assert univariate_distance(column_a, column_b, distance_metric="tvd") == 0.4
+    assert univariate_distance(
+        column_a, column_b, distance_metric="tvd"
+    ) == pytest.approx(0.4)
 
 
 @pytest.mark.parametrize("distance_metric", ["tvd", "kl", "js"])
@@ -120,67 +129,118 @@ def test_univariate_distances_in_data():
     df_a = pl.DataFrame({"column-1": ["a"] * 5 + ["b"] * 5, "column-2": ["x"] * 10})
     df_b = pl.DataFrame({"column-1": ["a"] * 9 + ["b"] * 1, "column-2": ["y"] * 10})
     df_result = univariate_distances_in_data(df_a, df_b, distance_metric="tvd")
-    assert df_result["tvd"][0] == 0.4
-    assert df_result["tvd"][1] == 1.0
+    assert df_result["tvd"][0] == pytest.approx(0.4)
+    assert df_result["tvd"][1] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("distance_metric", ["tvd", "kl", "js"])
 def test_bivariate_distance_smoke(distance_metric):
-    col = ["a"]
-    assert isinstance(bivariate_distance(col, col, col, col, distance_metric), float)
+    col = jnp.array([[0, 0]])
+    metric_enum = {
+        "tvd": DistanceMetric.TVD,
+        "kl": DistanceMetric.KL,
+        "js": DistanceMetric.JS,
+    }[distance_metric]
+    assert bivariate_distance(col, col, 1, 1, metric_enum) == pytest.approx(0.0)
 
 
 def test_bivariate_distance_spot():
-    assert (
-        bivariate_distance(
-            pl.Series("foo", ["a", "a", "b", "b"]),
-            pl.Series("bar", ["x", "x", "y", "y"]),
-            pl.Series("foo", ["a", "a", "a", "b"]),
-            pl.Series("bar", ["x", "x", "x", "y"]),
-            distance_metric="tvd",
-        )
-        == 0.25
-    )
+    assert bivariate_distance(
+        jnp.column_stack([jnp.array([0, 0, 1, 1]), jnp.array([0, 0, 1, 1])]),
+        jnp.column_stack([jnp.array([0, 0, 0, 1]), jnp.array([0, 0, 1, 1])]),
+        2,
+        2,
+        DistanceMetric.TVD,
+    ) == pytest.approx(0.25)
 
 
 def test_bivariate_distance_no_overlap_exception():
-    with pytest.raises(AssertionError) as exc_info:
-        bivariate_distance(
-            pl.Series("foo", ["a", "a", None, None]),
-            pl.Series("bar", [None, None, "y", "y"]),
-            pl.Series("foo", ["a", "a", "a", "b"]),
-            pl.Series("bar", ["x", "x", "x", "y"]),
-            distance_metric="tvd",
-        )
-    assert exc_info.type == AssertionError
+    # no overlap because -1 sentinel value in either x or y for every row in A
+    result = bivariate_distance(
+        jnp.column_stack([jnp.array([-1, -1, 1, 1]), jnp.array([0, 0, -1, -1])]),
+        jnp.column_stack([jnp.array([0, 0, 0, 1]), jnp.array([0, 0, 1, 1])]),
+        2,
+        2,
+        DistanceMetric.TVD,
+    )
+    assert jnp.isnan(result)
 
 
 def test_bivariate_distance_no_overlap_no_exception():
-    assert (
-        bivariate_distance(
-            pl.Series("foo", ["a", "a", None, None]),
-            pl.Series("bar", [None, None, "y", "y"]),
-            pl.Series("foo", ["a", "a", "a", "b"]),
-            pl.Series("bar", ["x", "x", "x", "y"]),
-            distance_metric="tvd",
-            overlap_required=False,
-        )
-        == None
+    # Test that empty arrays return NaN
+    empty_data = jnp.array([]).reshape(0, 2).astype(jnp.int32)
+
+    result = bivariate_distance(
+        empty_data,
+        empty_data,
+        2,
+        2,
+        DistanceMetric.TVD,
     )
+    assert jnp.isnan(result)
 
 
 def test_bivariate_distance_no_overlap_spot():
-    assert (
-        bivariate_distance(
-            pl.Series("foo", ["a", "a", "b", "b"]),
-            pl.Series("bar", ["x", "x", "y", "y"]),
-            pl.Series("foo", ["a", "a", "a", "b"]),
-            pl.Series("bar", ["x", "x", "x", "y"]),
-            distance_metric="tvd",
-            overlap_required=False,
-        )
-        == 0.25
+
+    df_a = pl.DataFrame({"foo": ["a", "a", "b", "b"], "bar": ["x", "x", "y", "y"]})
+    df_b = pl.DataFrame({"foo": ["a", "a", "a", "b"], "bar": ["x", "x", "x", "y"]})
+
+    odf_a, odf_b = OrdinalDF.from_dataframes([df_a, df_b])
+
+    assert bivariate_distance(
+        odf_a.data,
+        odf_b.data,
+        len(odf_a.encoders[0].categories_[0]),
+        len(odf_a.encoders[1].categories_[0]),
+        DistanceMetric.TVD,
+    ) == pytest.approx(0.25)
+
+
+def test_bivariate_distances_in_data_with_nulls():
+    # Test that bivariate_distances_in_data properly handles nulls as sentinels
+    # Pairs containing nulls are filtered out during counting
+    df_a = pl.DataFrame(
+        {"foo": ["a", "a", "b", None, "b"], "bar": ["x", "x", "y", "y", None]}
     )
+    df_b = pl.DataFrame(
+        {"foo": ["a", None, "a", "a", "b"], "bar": ["x", "x", None, "x", "y"]}
+    )
+
+    result = bivariate_distances_in_data(df_a, df_b, distance_metric="tvd")
+
+    # Should compute distance successfully, filtering out pairs with nulls
+    assert len(result) == 1  # Only one pair: (foo, bar)
+    assert result["column-1"][0] == "foo"
+    assert result["column-2"][0] == "bar"
+    assert isinstance(result["tvd"][0], float)
+    assert result["tvd"][0] >= 0.0
+
+
+def test_bivariate_distances_in_data_no_valid_pairs_exception():
+    # Test the old "no overlap" case: columns have no valid (non-null, non-null) pairs
+    # This replicates the old test case with ["a", "a", None, None] and [None, None, "y", "y"]
+    df_a = pl.DataFrame({"foo": ["a", "a", None, None], "bar": [None, None, "y", "y"]})
+    df_b = pl.DataFrame({"foo": ["a", "a", "a", "b"], "bar": ["x", "x", "x", "y"]})
+
+    # Should raise because no valid pairs exist between foo and bar in df_a
+    with pytest.raises(ValueError, match="no overlap"):
+        bivariate_distances_in_data(
+            df_a, df_b, distance_metric="tvd", overlap_required=True
+        )
+
+
+def test_bivariate_distances_in_data_no_valid_pairs_no_exception():
+    # Test that no valid pairs returns None when overlap_required=False
+    df_a = pl.DataFrame({"foo": ["a", "a", None, None], "bar": [None, None, "y", "y"]})
+    df_b = pl.DataFrame({"foo": ["a", "a", "a", "b"], "bar": ["x", "x", "x", "y"]})
+
+    result = bivariate_distances_in_data(
+        df_a, df_b, distance_metric="tvd", overlap_required=False
+    )
+
+    # Should return a dataframe with None for the distance
+    assert len(result) == 1
+    assert result["tvd"][0] is None
 
 
 @pytest.mark.parametrize("distance_metric", ["tvd", "kl", "js"])

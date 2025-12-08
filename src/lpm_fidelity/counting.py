@@ -1,8 +1,74 @@
 import sys
 from collections import Counter
+from functools import partial
 
+import equinox as eqx
 import numpy as np
 import polars as pl
+from jax import Array, jit, lax
+from jax import numpy as jnp
+from jaxtyping import Integer
+from sklearn.preprocessing import OrdinalEncoder
+
+
+class OrdinalDF(eqx.Module):
+    columns: tuple[str, ...]
+    encoders: tuple[OrdinalEncoder, ...] = eqx.field(static=True)
+    data: Array
+
+    def __init__(self, df: pl.DataFrame, encoders: dict[str, OrdinalEncoder]):
+        self.columns = tuple(encoders.keys())
+        self.encoders = tuple(encoders.values())
+        self.data = jnp.column_stack(
+            [
+                jnp.array(encoders[c].transform(df[c].to_numpy().reshape(-1, 1)))
+                for c in self.columns
+            ]
+        ).astype(jnp.int32)
+
+    @classmethod
+    def from_dataframe(cls, df: pl.DataFrame) -> "OrdinalDF":
+        return cls.from_dataframes([df])[0]
+
+    @classmethod
+    def from_dataframes(cls, dfs: list[pl.DataFrame]) -> list["OrdinalDF"]:
+        """A method for creating multiple OrdinalDFs under the assumption
+        that they have the same columns with the same possible categorical
+        values; use this method to ensure they encode&decode consistently,
+        and to protect against issues in the rare case that some value
+        happens not to appear in some dataframes.
+        """
+        assert len(dfs) > 0, "Must provide at least one dataframe"
+
+        # 1. check that all dataframes have same set() of columns
+        #    n.b. this counting method allows a list of 1 df, to support shared impl
+        first_columns = set(dfs[0].columns)
+        for df in dfs[1:]:
+            assert set(df.columns) == first_columns, (
+                "All dataframes must have the same columns"
+            )
+
+        # 2. concatenate dataframes vertically
+        concatenated = pl.concat(dfs, how="vertical")
+
+        # 3. create an encoders dict from the concatenated dataframe
+        # Use handle_unknown to map None -> -1 automatically
+        encoders = {}
+        for c in concatenated.columns:
+            col_data = concatenated[c].to_numpy().reshape(-1, 1)
+            unique_vals_set = set(col_data.flatten())
+            # Exclude None from categories - it will be handled as unknown -> -1
+            non_null_vals = sorted([v for v in unique_vals_set if v is not None])
+            enc = OrdinalEncoder(
+                categories=[non_null_vals],
+                handle_unknown="use_encoded_value",
+                unknown_value=-1,
+            )
+            enc.fit(col_data)
+            encoders[c] = enc
+
+        # 4. create an OrdinalDF *for each input dataframe* using the encoders dict
+        return [cls(df, encoders) for df in dfs]
 
 
 def _is_none_or_nan(value):
@@ -44,6 +110,67 @@ def normalize_count(column):
     column = [val for val in column if not _is_none_or_nan(val)]
     assert len(column) > 0
     return {k: v / len(column) for k, v in pl.Series(column).value_counts().rows()}
+
+
+@jit
+def _scan_count_pairs(memo: Array, pair: Integer[Array, "2"]) -> tuple[Array, None]:
+    """
+    Helper function for jax.lax.scan that updates count matrix with a single pair.
+
+    Skips pairs where either value is -1 (null sentinel from handle_unknown).
+
+    Parameters:
+    - memo: Current count matrix of shape (N, M)
+    - pair: Tuple of (n, m) indices to increment (-1 = None, 0+ = valid categories)
+
+    Returns:
+    - Updated memo array
+    - None (no auxiliary output needed)
+    """
+    return lax.cond(
+        jnp.any(pair == -1),  # Skip pairs containing -1 (null sentinel)
+        lambda: memo,
+        lambda: memo.at[pair[0], pair[1]].add(1),
+    ), None
+
+
+@partial(jit, static_argnums=(1, 2))
+def normalize_count_bivariate_memoized(
+    cols_1_and_2: Integer[Array, "n 2"],
+    c1_uniq_vals: int,
+    c2_uniq_vals: int,
+) -> tuple[Array, int]:
+    """
+    Count occurences of events between two categorical columns.
+    This works on Polars'columns i.e. Polars Series.
+
+    Parameters:
+    - cols_1_and_2 (Integer[Array, "n 2"]): A subsected pair of columns from a dataframe
+    - c1_uniq_vals (int): The number of unique values in the first column
+    - c2_uniq_vals (int): The number of unique values in the second column
+    - overlap_required bool:  If the two columns don't have non-null overlap,
+                              throw error
+
+    Returns:
+    - dict: A Python dictionary, where keys are tuples of encoded values from the
+      two columns and values are the normalized ([0,1]) counts.
+
+
+    Examples:
+    >>> normalize_count_bivariate(
+            pl.Series("foo", ["a", "b", "a", "a"])
+            pl.Series("foo", ["x", "y", "x", "y"]))
+
+    {(0, 0): 0.5, (0, 1): 0.25, (1, 1): 0.25}
+    """
+
+    memo = jnp.zeros((c1_uniq_vals, c2_uniq_vals), dtype=jnp.int32)
+
+    final_memo, _ = lax.scan(_scan_count_pairs, memo, cols_1_and_2)
+
+    # normalize into probabilities of each event in the dataset
+    total_count = jnp.sum(final_memo).astype(jnp.float32)
+    return final_memo, total_count
 
 
 def normalize_count_bivariate(column_1, column_2, overlap_required=True):
